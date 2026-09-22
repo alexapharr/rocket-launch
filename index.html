@@ -1,0 +1,966 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title></title>
+<style>
+html, body {
+  margin: 0;
+  overflow: hidden;
+  width: 100%;
+  height: 100%;
+  background: #87CEEB;
+}
+canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+</style>
+</head>
+<body>
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  // ─── Renderer ───────────────────────────────────────────────
+  const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.15;
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  document.body.appendChild(renderer.domElement);
+
+  // ─── Scene & Sky ────────────────────────────────────────────
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x5eb8f0);
+  scene.fog = new THREE.FogExp2(0x9fd4f5, 0.0018);
+
+  // ─── Camera ─────────────────────────────────────────────────
+  const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.5, 2000);
+  camera.position.set(28, 18, 42);
+
+  // ─── Clock & Timeline ───────────────────────────────────────
+  const clock = new THREE.Clock();
+  // t=0 calm | ~2s smoke | ~4s ignition | ~6s full thrust+vibrate | ~7.5s clamps | ~8s liftoff
+  const T = {
+    smoke: 2.0,
+    ignite: 4.0,
+    fullThrust: 6.0,
+    clampRelease: 7.5,
+    liftoff: 8.0
+  };
+
+  let rocketY = 0;
+  let rocketVel = 0;
+  let liftOff = false;
+  let vibrateAmp = 0;
+  let engineIntensity = 0;
+  let smokeIntensity = 0;
+  let clampOpen = 0;
+
+  // ─── Shared helpers ─────────────────────────────────────────
+  function makeMat(color, opts) {
+    opts = opts || {};
+    return new THREE.MeshStandardMaterial({
+      color: color,
+      metalness: opts.metalness != null ? opts.metalness : 0.35,
+      roughness: opts.roughness != null ? opts.roughness : 0.45,
+      emissive: opts.emissive || 0x000000,
+      emissiveIntensity: opts.emissiveIntensity || 0
+    });
+  }
+
+  function softCircleTexture(size, r, g, b, a) {
+    const c = document.createElement('canvas');
+    c.width = c.height = size;
+    const ctx = c.getContext('2d');
+    const g2 = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+    g2.addColorStop(0, 'rgba(' + r + ',' + g + ',' + b + ',' + a + ')');
+    g2.addColorStop(0.35, 'rgba(' + r + ',' + g + ',' + b + ',' + (a * 0.55) + ')');
+    g2.addColorStop(0.7, 'rgba(' + r + ',' + g + ',' + b + ',' + (a * 0.15) + ')');
+    g2.addColorStop(1, 'rgba(' + r + ',' + g + ',' + b + ',0)');
+    ctx.fillStyle = g2;
+    ctx.fillRect(0, 0, size, size);
+    const tex = new THREE.CanvasTexture(c);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
+  const smokeTex = softCircleTexture(64, 230, 230, 235, 0.55);
+  const dustTex = softCircleTexture(64, 210, 180, 120, 0.7);
+  const sparkTex = softCircleTexture(32, 255, 200, 80, 1.0);
+  const emberTex = softCircleTexture(32, 255, 120, 40, 1.0);
+  const flameCoreTex = softCircleTexture(64, 255, 255, 220, 1.0);
+
+  // ─── Lights ─────────────────────────────────────────────────
+  const sun = new THREE.DirectionalLight(0xfff4e0, 2.2);
+  sun.position.set(60, 100, 40);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048);
+  sun.shadow.camera.near = 10;
+  sun.shadow.camera.far = 250;
+  sun.shadow.camera.left = -60;
+  sun.shadow.camera.right = 60;
+  sun.shadow.camera.top = 60;
+  sun.shadow.camera.bottom = -60;
+  sun.shadow.bias = -0.0003;
+  scene.add(sun);
+
+  const hemi = new THREE.HemisphereLight(0x87ceeb, 0x6a9a4a, 0.85);
+  scene.add(hemi);
+
+  const ambient = new THREE.AmbientLight(0xb0d4ff, 0.35);
+  scene.add(ambient);
+
+  const engineLight = new THREE.PointLight(0xffa040, 0, 80, 1.5);
+  engineLight.position.set(0, 2, 0);
+  scene.add(engineLight);
+
+  const engineLight2 = new THREE.PointLight(0xff6020, 0, 50, 1.8);
+  engineLight2.position.set(0, 0, 0);
+  scene.add(engineLight2);
+
+  // ─── Ground / Terrain ───────────────────────────────────────
+  const groundGeo = new THREE.PlaneGeometry(600, 600, 64, 64);
+  const pos = groundGeo.attributes.position;
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), y = pos.getY(i);
+    const d = Math.sqrt(x * x + y * y);
+    let h = Math.sin(x * 0.03) * Math.cos(y * 0.025) * 2.5;
+    h += Math.sin(x * 0.08 + 1.2) * Math.cos(y * 0.07) * 1.2;
+    if (d < 40) h *= d / 40;
+    if (d < 18) h = 0;
+    pos.setZ(i, h);
+  }
+  groundGeo.computeVertexNormals();
+
+  const groundMat = new THREE.MeshStandardMaterial({
+    color: 0x4a9a3c,
+    roughness: 0.92,
+    metalness: 0.05,
+    flatShading: false
+  });
+  const ground = new THREE.Mesh(groundGeo, groundMat);
+  ground.rotation.x = -Math.PI / 2;
+  ground.receiveShadow = true;
+  scene.add(ground);
+
+  // Concrete pad
+  const padMat = makeMat(0xb8b0a0, { metalness: 0.1, roughness: 0.85 });
+  const pad = new THREE.Mesh(new THREE.CylinderGeometry(14, 15, 0.6, 48), padMat);
+  pad.position.y = 0.3;
+  pad.receiveShadow = true;
+  pad.castShadow = true;
+  scene.add(pad);
+
+  const padRing = new THREE.Mesh(
+    new THREE.TorusGeometry(10, 0.25, 8, 48),
+    makeMat(0x888880, { metalness: 0.5, roughness: 0.4 })
+  );
+  padRing.rotation.x = Math.PI / 2;
+  padRing.position.y = 0.65;
+  scene.add(padRing);
+
+  // Flame trench
+  const trench = new THREE.Mesh(
+    new THREE.BoxGeometry(8, 1.2, 18),
+    makeMat(0x555550, { metalness: 0.3, roughness: 0.7 })
+  );
+  trench.position.set(0, -0.3, 4);
+  trench.receiveShadow = true;
+  scene.add(trench);
+
+  // Distant hills
+  const hillMat = new THREE.MeshStandardMaterial({ color: 0x3d8a45, roughness: 0.95, metalness: 0 });
+  for (let i = 0; i < 12; i++) {
+    const ang = (i / 12) * Math.PI * 2 + 0.3;
+    const dist = 120 + (i % 3) * 30;
+    const hill = new THREE.Mesh(
+      new THREE.ConeGeometry(28 + (i % 4) * 8, 18 + (i % 5) * 6, 7),
+      hillMat
+    );
+    hill.position.set(Math.cos(ang) * dist, 4, Math.sin(ang) * dist);
+    hill.rotation.y = ang;
+    hill.receiveShadow = true;
+    scene.add(hill);
+  }
+
+  // ─── Grass blades (instanced, react to exhaust) ─────────────
+  const grassCount = 800;
+  const bladeGeo = new THREE.ConeGeometry(0.08, 0.9, 3);
+  bladeGeo.translate(0, 0.45, 0);
+  const bladeMat = new THREE.MeshStandardMaterial({
+    color: 0x5cb85c,
+    roughness: 0.9,
+    metalness: 0,
+    flatShading: true
+  });
+  const grass = new THREE.InstancedMesh(bladeGeo, bladeMat, grassCount);
+  grass.castShadow = false;
+  grass.receiveShadow = true;
+  const grassDummy = new THREE.Object3D();
+  const grassBase = [];
+  for (let i = 0; i < grassCount; i++) {
+    let x, z, d;
+    do {
+      x = (Math.random() - 0.5) * 90;
+      z = (Math.random() - 0.5) * 90;
+      d = Math.sqrt(x * x + z * z);
+    } while (d < 16);
+    const s = 0.6 + Math.random() * 1.1;
+    grassDummy.position.set(x, 0, z);
+    grassDummy.rotation.set(0, Math.random() * Math.PI, (Math.random() - 0.5) * 0.2);
+    grassDummy.scale.set(s, s, s);
+    grassDummy.updateMatrix();
+    grass.setMatrixAt(i, grassDummy.matrix);
+    grassBase.push({ x: x, z: z, s: s, phase: Math.random() * Math.PI * 2 });
+  }
+  grass.instanceMatrix.needsUpdate = true;
+  scene.add(grass);
+
+  // Colored wildflower dots
+  const flowerMat = new THREE.MeshStandardMaterial({ color: 0xff6688, roughness: 0.6 });
+  const flowerGeo = new THREE.SphereGeometry(0.12, 6, 4);
+  for (let i = 0; i < 60; i++) {
+    let x, z;
+    do {
+      x = (Math.random() - 0.5) * 70;
+      z = (Math.random() - 0.5) * 70;
+    } while (Math.sqrt(x * x + z * z) < 16);
+    const f = new THREE.Mesh(flowerGeo, flowerMat);
+    f.position.set(x, 0.3, z);
+    f.material = flowerMat.clone();
+    f.material.color.setHSL(Math.random(), 0.75, 0.55);
+    scene.add(f);
+  }
+
+  // ─── Launch Towers & Structures ─────────────────────────────
+  const steel = makeMat(0x8a9098, { metalness: 0.7, roughness: 0.35 });
+  const steelDark = makeMat(0x4a5058, { metalness: 0.65, roughness: 0.4 });
+  const orange = makeMat(0xe07020, { metalness: 0.4, roughness: 0.45 });
+  const yellow = makeMat(0xe8c020, { metalness: 0.3, roughness: 0.5 });
+  const redStripe = makeMat(0xc03030, { metalness: 0.3, roughness: 0.5 });
+
+  function box(w, h, d, mat, x, y, z, parent) {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+    m.position.set(x, y, z);
+    m.castShadow = true;
+    m.receiveShadow = true;
+    (parent || scene).add(m);
+    return m;
+  }
+
+  function cyl(rT, rB, h, mat, x, y, z, parent, segs) {
+    const m = new THREE.Mesh(new THREE.CylinderGeometry(rT, rB, h, segs || 12), mat);
+    m.position.set(x, y, z);
+    m.castShadow = true;
+    m.receiveShadow = true;
+    (parent || scene).add(m);
+    return m;
+  }
+
+  // Main umbilical tower (left)
+  const towerGroup = new THREE.Group();
+  scene.add(towerGroup);
+
+  box(3.5, 42, 3.5, steel, -9, 21, 0, towerGroup);
+  // Cross beams
+  for (let i = 0; i < 8; i++) {
+    box(5, 0.35, 0.35, yellow, -9, 3 + i * 5, 1.8, towerGroup);
+    box(5, 0.35, 0.35, yellow, -9, 3 + i * 5, -1.8, towerGroup);
+    box(0.3, 0.3, 3.5, steelDark, -7.2, 3 + i * 5, 0, towerGroup);
+    box(0.3, 0.3, 3.5, steelDark, -10.8, 3 + i * 5, 0, towerGroup);
+  }
+  // Ladder
+  for (let i = 0; i < 40; i++) {
+    box(0.8, 0.08, 0.08, steelDark, -7.4, 1 + i, 1.9, towerGroup);
+  }
+  // Platforms
+  box(6, 0.25, 5, steel, -8, 12, 0, towerGroup);
+  box(6, 0.25, 5, steel, -8, 24, 0, towerGroup);
+  box(5, 0.25, 4, steel, -8, 34, 0, towerGroup);
+
+  // Right support tower
+  const towerR = new THREE.Group();
+  scene.add(towerR);
+  box(2.8, 36, 2.8, steel, 9, 18, 0, towerR);
+  for (let i = 0; i < 7; i++) {
+    box(4, 0.3, 0.3, orange, 9, 4 + i * 5, 1.5, towerR);
+    box(4, 0.3, 0.3, orange, 9, 4 + i * 5, -1.5, towerR);
+  }
+  box(5, 0.25, 4, steel, 8.5, 14, 0, towerR);
+  box(5, 0.25, 4, steel, 8.5, 26, 0, towerR);
+
+  // Rear lattice tower
+  box(2.2, 30, 2.2, steelDark, 0, 15, -10, null);
+  for (let i = 0; i < 6; i++) {
+    box(0.2, 0.2, 4, yellow, 1.2, 3 + i * 4.5, -10, null);
+    box(0.2, 0.2, 4, yellow, -1.2, 3 + i * 4.5, -10, null);
+  }
+
+  // Clamps / mechanical arms (animate open)
+  const clamps = new THREE.Group();
+  scene.add(clamps);
+
+  function makeClamp(angle, height) {
+    const g = new THREE.Group();
+    g.rotation.y = angle;
+    const arm = box(0.45, 0.45, 5.5, orange, 0, 0, 2.8, g);
+    arm.position.set(0, 0, 4.5);
+    const claw = box(0.7, 1.2, 0.5, yellow, 0, 0, 1.5, g);
+    claw.position.set(0, 0, 1.8);
+    const hinge = cyl(0.35, 0.35, 0.5, steel, 0, 0, 7.2, g, 8);
+    hinge.rotation.x = Math.PI / 2;
+    hinge.position.set(0, 0, 7.0);
+    g.position.y = height;
+    clamps.add(g);
+    return g;
+  }
+
+  const clampArms = [
+    makeClamp(0, 14),
+    makeClamp(Math.PI * 0.5, 18),
+    makeClamp(Math.PI, 14),
+    makeClamp(Math.PI * 1.5, 22),
+    makeClamp(Math.PI * 0.25, 28),
+    makeClamp(Math.PI * 1.25, 28)
+  ];
+
+  // Pipes around pad
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2;
+    const pipe = cyl(0.18, 0.18, 6 + (i % 3), makeMat(0x6688aa, { metalness: 0.8, roughness: 0.25 }),
+      Math.cos(a) * 12, 3, Math.sin(a) * 12, null, 8);
+    pipe.rotation.z = (Math.random() - 0.5) * 0.3;
+  }
+  // Horizontal pipe runs
+  box(20, 0.3, 0.3, makeMat(0x557799, { metalness: 0.8, roughness: 0.3 }), 0, 1.2, 11, null);
+  box(0.3, 0.3, 16, makeMat(0x557799, { metalness: 0.8, roughness: 0.3 }), 12, 1.5, 0, null);
+
+  // Barriers
+  for (let i = 0; i < 16; i++) {
+    const a = (i / 16) * Math.PI * 2;
+    box(1.8, 1.0, 0.15, redStripe, Math.cos(a) * 17, 0.7, Math.sin(a) * 17, null)
+      .rotation.y = a + Math.PI / 2;
+  }
+
+  // Service equipment crates
+  box(2.5, 1.8, 2, orange, 16, 0.9, 8, null);
+  box(1.8, 1.2, 1.5, yellow, 15, 0.6, 11, null);
+  box(2, 2.2, 1.6, steelDark, -15, 1.1, 9, null);
+  box(3, 1.4, 2.2, makeMat(0x4488cc, { metalness: 0.5, roughness: 0.4 }), -14, 0.7, -8, null);
+
+  // Fuel tanks
+  cyl(1.8, 1.8, 5, makeMat(0xd0d8e0, { metalness: 0.6, roughness: 0.3 }), 18, 2.5, -6, null, 16);
+  cyl(1.4, 1.4, 4, makeMat(0xc0d0e8, { metalness: 0.6, roughness: 0.3 }), 18, 2, -10, null, 16);
+  // Tank caps
+  const tankCap = new THREE.Mesh(new THREE.SphereGeometry(1.8, 12, 8, 0, Math.PI * 2, 0, Math.PI / 2),
+    makeMat(0xd0d8e0, { metalness: 0.6, roughness: 0.3 }));
+  tankCap.position.set(18, 5, -6);
+  tankCap.castShadow = true;
+  scene.add(tankCap);
+
+  // ─── Rocket ─────────────────────────────────────────────────
+  const rocket = new THREE.Group();
+  scene.add(rocket);
+
+  const white = makeMat(0xf2f4f8, { metalness: 0.45, roughness: 0.3 });
+  const whiteDark = makeMat(0xd8dce4, { metalness: 0.5, roughness: 0.35 });
+  const black = makeMat(0x1a1a20, { metalness: 0.6, roughness: 0.4 });
+  const blueAcc = makeMat(0x2060c0, { metalness: 0.4, roughness: 0.35 });
+  const gold = makeMat(0xd4a020, { metalness: 0.7, roughness: 0.3 });
+
+  // Main body stages
+  const bodyLower = cyl(2.4, 2.6, 14, white, 0, 8, 0, rocket, 24);
+  const bodyMid = cyl(2.3, 2.4, 10, whiteDark, 0, 20, 0, rocket, 24);
+  const bodyUpper = cyl(2.1, 2.3, 8, white, 0, 29, 0, rocket, 24);
+
+  // Nose cone
+  const nose = new THREE.Mesh(new THREE.ConeGeometry(2.1, 7, 24), makeMat(0xe8ecf4, { metalness: 0.5, roughness: 0.25 }));
+  nose.position.y = 36.5;
+  nose.castShadow = true;
+  rocket.add(nose);
+
+  // Nose tip
+  cyl(0.15, 0.4, 1.5, black, 0, 40.5, 0, rocket, 8);
+
+  // Interstage rings / panel lines
+  for (let i = 0; i < 6; i++) {
+    const ring = cyl(2.65, 2.65, 0.15, black, 0, 4 + i * 5.5, 0, rocket, 24);
+  }
+  // Blue accent bands
+  cyl(2.42, 2.42, 0.8, blueAcc, 0, 12, 0, rocket, 24);
+  cyl(2.32, 2.32, 0.6, blueAcc, 0, 22, 0, rocket, 24);
+  cyl(2.12, 2.12, 0.5, gold, 0, 31, 0, rocket, 24);
+
+  // Panel detail boxes
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2;
+    box(0.08, 3, 0.6, makeMat(0xc8ccd4, { metalness: 0.5, roughness: 0.4 }),
+      Math.cos(a) * 2.45, 10, Math.sin(a) * 2.45, rocket).rotation.y = a;
+  }
+
+  // Windows / ports
+  for (let i = 0; i < 4; i++) {
+    const a = (i / 4) * Math.PI * 2 + 0.4;
+    const win = cyl(0.25, 0.25, 0.15, makeMat(0x88ccff, { metalness: 0.9, roughness: 0.1, emissive: 0x224466, emissiveIntensity: 0.3 }),
+      Math.cos(a) * 2.35, 27, Math.sin(a) * 2.35, rocket, 8);
+    win.rotation.z = Math.PI / 2;
+    win.rotation.y = a;
+  }
+
+  // Fins (4)
+  const finShape = new THREE.Shape();
+  finShape.moveTo(0, 0);
+  finShape.lineTo(3.5, 0);
+  finShape.lineTo(3.5, 1.5);
+  finShape.lineTo(0.5, 5);
+  finShape.lineTo(0, 5);
+  finShape.closePath();
+  const finGeo = new THREE.ExtrudeGeometry(finShape, { depth: 0.18, bevelEnabled: false });
+  const finMat = makeMat(0x1a3060, { metalness: 0.4, roughness: 0.4 });
+  for (let i = 0; i < 4; i++) {
+    const fin = new THREE.Mesh(finGeo, finMat);
+    fin.position.set(0, 0.5, 0);
+    fin.rotation.y = (i / 4) * Math.PI * 2;
+    fin.translateX(2.4);
+    fin.castShadow = true;
+    rocket.add(fin);
+  }
+
+  // Engines (5: center + 4 around)
+  const engineGroup = new THREE.Group();
+  rocket.add(engineGroup);
+  engineGroup.position.y = 0.5;
+
+  const engineBellMat = makeMat(0x3a3a42, { metalness: 0.85, roughness: 0.25 });
+  const enginePositions = [[0, 0], [1.5, 0], [-1.5, 0], [0, 1.5], [0, -1.5]];
+  const engineBells = [];
+
+  enginePositions.forEach(function (p) {
+    const bell = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.35, 0.85, 2.2, 16),
+      engineBellMat
+    );
+    bell.position.set(p[0], -0.6, p[1]);
+    bell.castShadow = true;
+    engineGroup.add(bell);
+    engineBells.push(bell);
+    // Nozzle rim
+    cyl(0.9, 0.9, 0.12, makeMat(0x888890, { metalness: 0.9, roughness: 0.2 }), p[0], -1.7, p[1], engineGroup, 16);
+  });
+
+  // Heat shield base
+  cyl(2.7, 2.5, 0.4, black, 0, 1.0, 0, rocket, 24);
+
+  rocket.position.y = 0.8;
+
+  // ─── Flames ─────────────────────────────────────────────────
+  const flameGroup = new THREE.Group();
+  rocket.add(flameGroup);
+  flameGroup.position.y = -1.2;
+
+  function makeFlame(radius, height, color, emissive, y) {
+    const mat = new THREE.MeshBasicMaterial({
+      color: color,
+      transparent: true,
+      opacity: 0,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      side: THREE.DoubleSide
+    });
+    const mesh = new THREE.Mesh(new THREE.ConeGeometry(radius, height, 12, 1, true), mat);
+    mesh.position.y = y;
+    mesh.rotation.x = Math.PI;
+    flameGroup.add(mesh);
+    return mesh;
+  }
+
+  const flames = [];
+  // Per-engine flame stacks
+  enginePositions.forEach(function (p) {
+    const g = new THREE.Group();
+    g.position.set(p[0], 0, p[1]);
+    flameGroup.add(g);
+    const core = makeFlame(0.3, 3.5, 0xffffee, 0xffffaa, -1.5);
+    g.add(core);
+    const mid = makeFlame(0.55, 5.5, 0xffaa33, 0xff8800, -2.2);
+    g.add(mid);
+    const outer = makeFlame(0.85, 8, 0xff4400, 0xff2200, -3.0);
+    g.add(outer);
+    const trail = makeFlame(0.5, 12, 0xff6622, 0xff3300, -5.5);
+    g.add(trail);
+    flames.push({ group: g, core: core, mid: mid, outer: outer, trail: trail });
+  });
+
+  // Central big plume (long exhaust)
+  const plumeCore = makeFlame(1.2, 18, 0xffeeaa, 0xffff88, -8);
+  flameGroup.add(plumeCore);
+  const plumeOuter = makeFlame(2.2, 28, 0xff6611, 0xff4400, -12);
+  flameGroup.add(plumeOuter);
+  const plumeGlow = makeFlame(3.5, 20, 0xff3300, 0xff1100, -10);
+  flameGroup.add(plumeGlow);
+
+  // Sprite flame billboards for extra glow
+  const flameSpriteMat = new THREE.SpriteMaterial({
+    map: flameCoreTex,
+    color: 0xffaa44,
+    transparent: true,
+    opacity: 0,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false
+  });
+  const flameSprites = [];
+  for (let i = 0; i < 8; i++) {
+    const sp = new THREE.Sprite(flameSpriteMat.clone());
+    sp.scale.set(4, 6, 1);
+    flameGroup.add(sp);
+    flameSprites.push(sp);
+  }
+
+  // ─── Particle systems ───────────────────────────────────────
+  function createParticles(count, texture, color, size) {
+    const geo = new THREE.BufferGeometry();
+    const positions = new Float32Array(count * 3);
+    const velocities = new Float32Array(count * 3);
+    const lifetimes = new Float32Array(count);
+    const ages = new Float32Array(count);
+    const sizes = new Float32Array(count);
+    for (let i = 0; i < count; i++) {
+      positions[i * 3] = 0;
+      positions[i * 3 + 1] = -100;
+      positions[i * 3 + 2] = 0;
+      lifetimes[i] = 1 + Math.random() * 2;
+      ages[i] = lifetimes[i];
+      sizes[i] = size * (0.5 + Math.random());
+    }
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+    const mat = new THREE.PointsMaterial({
+      map: texture,
+      color: color,
+      size: size,
+      transparent: true,
+      opacity: 0.7,
+      depthWrite: false,
+      blending: THREE.NormalBlending,
+      sizeAttenuation: true
+    });
+    const pts = new THREE.Points(geo, mat);
+    pts.frustumCulled = false;
+    scene.add(pts);
+    return { pts: pts, positions: positions, velocities: velocities, lifetimes: lifetimes, ages: ages, sizes: sizes, count: count, mat: mat };
+  }
+
+  const smoke = createParticles(450, smokeTex, 0xe8e8f0, 4.5);
+  smoke.mat.blending = THREE.NormalBlending;
+  smoke.mat.opacity = 0.55;
+
+  const dust = createParticles(280, dustTex, 0xc8a878, 3.2);
+  dust.mat.opacity = 0.6;
+
+  const sparks = createParticles(120, sparkTex, 0xffcc44, 0.8);
+  sparks.mat.blending = THREE.AdditiveBlending;
+  sparks.mat.opacity = 0.9;
+
+  const embers = createParticles(80, emberTex, 0xff6622, 0.6);
+  embers.mat.blending = THREE.AdditiveBlending;
+
+  // Exhaust plume particles (follow rocket)
+  const plume = createParticles(200, smokeTex, 0xffaa66, 3.5);
+  plume.mat.blending = THREE.AdditiveBlending;
+  plume.mat.opacity = 0.45;
+  plume.mat.color = new THREE.Color(0xff8844);
+
+  function emitParticle(sys, x, y, z, vx, vy, vz, lifeScale) {
+    // Find dead particle
+    for (let i = 0; i < sys.count; i++) {
+      if (sys.ages[i] >= sys.lifetimes[i]) {
+        sys.positions[i * 3] = x;
+        sys.positions[i * 3 + 1] = y;
+        sys.positions[i * 3 + 2] = z;
+        sys.velocities[i * 3] = vx;
+        sys.velocities[i * 3 + 1] = vy;
+        sys.velocities[i * 3 + 2] = vz;
+        sys.ages[i] = 0;
+        sys.lifetimes[i] = (1 + Math.random() * 2) * (lifeScale || 1);
+        return;
+      }
+    }
+  }
+
+  function updateParticles(sys, dt, fade) {
+    const pos = sys.positions;
+    const vel = sys.velocities;
+    for (let i = 0; i < sys.count; i++) {
+      if (sys.ages[i] < sys.lifetimes[i]) {
+        sys.ages[i] += dt;
+        pos[i * 3] += vel[i * 3] * dt;
+        pos[i * 3 + 1] += vel[i * 3 + 1] * dt;
+        pos[i * 3 + 2] += vel[i * 3 + 2] * dt;
+        // Drag / swirl
+        vel[i * 3] *= 0.985;
+        vel[i * 3 + 2] *= 0.985;
+        vel[i * 3] += (Math.random() - 0.5) * 0.8 * dt;
+        vel[i * 3 + 2] += (Math.random() - 0.5) * 0.8 * dt;
+        if (sys.ages[i] >= sys.lifetimes[i]) {
+          pos[i * 3 + 1] = -100;
+        }
+      }
+    }
+    sys.pts.geometry.attributes.position.needsUpdate = true;
+    if (fade != null) sys.mat.opacity = fade;
+  }
+
+  // ─── Clouds ─────────────────────────────────────────────────
+  const cloudGroup = new THREE.Group();
+  scene.add(cloudGroup);
+  const cloudMat = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    roughness: 1,
+    metalness: 0,
+    transparent: true,
+    opacity: 0.88,
+    flatShading: true
+  });
+
+  function makeCloud(x, y, z, scale) {
+    const g = new THREE.Group();
+    const n = 5 + Math.floor(Math.random() * 4);
+    for (let i = 0; i < n; i++) {
+      const s = (0.6 + Math.random() * 0.8) * scale;
+      const puff = new THREE.Mesh(new THREE.SphereGeometry(s, 7, 5), cloudMat);
+      puff.position.set(
+        (Math.random() - 0.5) * scale * 2.5,
+        (Math.random() - 0.5) * scale * 0.6,
+        (Math.random() - 0.5) * scale * 1.5
+      );
+      g.add(puff);
+    }
+    g.position.set(x, y, z);
+    cloudGroup.add(g);
+    return g;
+  }
+
+  // Layered clouds at different heights
+  for (let i = 0; i < 18; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const d = 40 + Math.random() * 120;
+    makeCloud(Math.cos(a) * d, 45 + Math.random() * 25, Math.sin(a) * d, 4 + Math.random() * 5);
+  }
+  for (let i = 0; i < 14; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const d = 30 + Math.random() * 100;
+    makeCloud(Math.cos(a) * d, 80 + Math.random() * 40, Math.sin(a) * d, 5 + Math.random() * 6);
+  }
+  for (let i = 0; i < 10; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const d = 20 + Math.random() * 80;
+    makeCloud(Math.cos(a) * d, 140 + Math.random() * 50, Math.sin(a) * d, 6 + Math.random() * 7);
+  }
+
+  // ─── Camera state ───────────────────────────────────────────
+  const camTarget = new THREE.Vector3(0, 18, 0);
+  const camPos = new THREE.Vector3(28, 18, 42);
+  let shakeAmp = 0;
+  const lookAt = new THREE.Vector3();
+
+  function noise(t) {
+    return Math.sin(t * 17.1) * 0.4 + Math.sin(t * 31.7) * 0.3 + Math.sin(t * 53.3) * 0.2;
+  }
+
+  // ─── Resize ─────────────────────────────────────────────────
+  window.addEventListener('resize', function () {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  // ─── Animation loop ─────────────────────────────────────────
+  function animate() {
+    requestAnimationFrame(animate);
+    const dt = Math.min(clock.getDelta(), 0.05);
+    const t = clock.elapsedTime;
+
+    // ── Timeline phases ──
+    // Smoke builds
+    if (t >= T.smoke && t < T.ignite) {
+      smokeIntensity = Math.min(1, (t - T.smoke) / 1.5);
+    } else if (t >= T.ignite) {
+      smokeIntensity = Math.min(1.5, smokeIntensity + dt * 0.3);
+    }
+
+    // Engine ignition
+    if (t >= T.ignite && t < T.fullThrust) {
+      engineIntensity = Math.min(1, (t - T.ignite) / 1.5);
+      shakeAmp = engineIntensity * 0.35;
+    } else if (t >= T.fullThrust) {
+      engineIntensity = Math.min(1.2, engineIntensity + dt * 0.4);
+      shakeAmp = 0.55;
+    }
+
+    // Vibration
+    if (t >= T.fullThrust && t < T.liftoff + 1) {
+      vibrateAmp = Math.min(0.15, (t - T.fullThrust) * 0.08);
+    } else if (t >= T.liftoff + 1) {
+      vibrateAmp = Math.max(0, vibrateAmp - dt * 0.1);
+    }
+
+    // Clamps release
+    if (t >= T.clampRelease) {
+      clampOpen = Math.min(1, (t - T.clampRelease) / 0.8);
+    }
+
+    // Liftoff
+    if (t >= T.liftoff) {
+      liftOff = true;
+      const flightTime = t - T.liftoff;
+      // Accelerating climb: a ≈ 4 + 6*t (stylized)
+      rocketVel += (3.5 + flightTime * 5.5) * dt;
+      rocketY += rocketVel * dt;
+      shakeAmp = Math.max(0.15, 0.6 - flightTime * 0.08);
+    }
+
+    // Apply rocket transform
+    const vibX = vibrateAmp * noise(t * 40);
+    const vibZ = vibrateAmp * noise(t * 37 + 2);
+    rocket.position.set(vibX, 0.8 + rocketY, vibZ);
+    rocket.rotation.z = vibX * 0.02;
+    rocket.rotation.x = vibZ * 0.02;
+
+    // Clamps animate open (swing outward)
+    clampArms.forEach(function (arm, i) {
+      const baseAngle = (i % 2 === 0 ? 1 : -1);
+      arm.rotation.z = clampOpen * baseAngle * 0.7;
+      arm.position.x = Math.sin(arm.rotation.y) * clampOpen * 1.5;
+      arm.position.z = Math.cos(arm.rotation.y) * clampOpen * 1.5 * (i < 4 ? 1 : 0.5);
+    });
+
+    // ── Flames ──
+    const ei = engineIntensity;
+    flameGroup.visible = ei > 0.01;
+    flames.forEach(function (f, idx) {
+      const flicker = 0.85 + 0.15 * Math.sin(t * 28 + idx * 1.7);
+      const flick2 = 0.8 + 0.2 * Math.sin(t * 41 + idx * 2.3);
+      f.core.material.opacity = ei * 0.95 * flicker;
+      f.mid.material.opacity = ei * 0.7 * flick2;
+      f.outer.material.opacity = ei * 0.5 * flicker;
+      f.trail.material.opacity = ei * 0.35 * flick2;
+      const lenScale = liftOff ? 1 + Math.min(2.5, rocketY * 0.04) : 1;
+      f.core.scale.set(flicker, lenScale * flicker, flicker);
+      f.mid.scale.set(flick2, lenScale * 1.1 * flick2, flick2);
+      f.outer.scale.set(flicker, lenScale * 1.2 * flicker, flicker);
+      f.trail.scale.set(flick2, lenScale * (liftOff ? 1.8 : 1.0) * flick2, flick2);
+    });
+
+    const plumeLen = liftOff ? 1 + Math.min(3, rocketY * 0.05) : Math.max(0.3, ei);
+    plumeCore.material.opacity = ei * 0.8;
+    plumeOuter.material.opacity = ei * 0.45;
+    plumeGlow.material.opacity = ei * 0.25;
+    plumeCore.scale.set(1, plumeLen, 1);
+    plumeOuter.scale.set(1 + ei * 0.3, plumeLen * 1.2, 1 + ei * 0.3);
+    plumeGlow.scale.set(1.2, plumeLen, 1.2);
+
+    flameSprites.forEach(function (sp, i) {
+      sp.material.opacity = ei * 0.5 * (0.7 + 0.3 * Math.sin(t * 20 + i));
+      sp.position.set(
+        (Math.random() - 0.5) * 2,
+        -2 - i * 1.2 * plumeLen - Math.random() * 2,
+        (Math.random() - 0.5) * 2
+      );
+      const sc = (3 + i * 0.8) * (0.8 + Math.random() * 0.4) * (liftOff ? 1.3 : 1);
+      sp.scale.set(sc, sc * 1.5, 1);
+    });
+
+    // Engine lights
+    engineLight.intensity = ei * 40 * (0.85 + 0.15 * Math.sin(t * 25));
+    engineLight.position.set(rocket.position.x, rocket.position.y - 2, rocket.position.z);
+    engineLight2.intensity = ei * 25;
+    engineLight2.position.set(rocket.position.x, rocket.position.y - 5 - (liftOff ? rocketY * 0.1 : 0), rocket.position.z);
+    engineLight.color.setHSL(0.08, 1, 0.55 + ei * 0.1);
+
+    // Heat glow on pad materials when thrusting
+    if (ei > 0.3) {
+      pad.material.emissive = new THREE.Color(0xff4400);
+      pad.material.emissiveIntensity = (ei - 0.3) * 0.25;
+    }
+
+    // ── Emit particles ──
+    const ry = rocket.position.y;
+    // Pre-launch + launch smoke/dust at pad
+    if (smokeIntensity > 0.05) {
+      const nSmoke = Math.floor(smokeIntensity * (liftOff && rocketY < 40 ? 8 : 5));
+      for (let i = 0; i < nSmoke; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const sp = 3 + Math.random() * 8 * smokeIntensity;
+        emitParticle(smoke,
+          Math.cos(a) * (2 + Math.random() * 4),
+          0.5 + Math.random() * 2,
+          Math.sin(a) * (2 + Math.random() * 4),
+          Math.cos(a) * sp, 2 + Math.random() * 5, Math.sin(a) * sp,
+          1.5
+        );
+      }
+      if (ei > 0.2) {
+        for (let i = 0; i < 6; i++) {
+          const a = Math.random() * Math.PI * 2;
+          const sp = 6 + Math.random() * 14 * ei;
+          emitParticle(dust,
+            Math.cos(a) * (1 + Math.random() * 3),
+            0.2,
+            Math.sin(a) * (1 + Math.random() * 3),
+            Math.cos(a) * sp, 1 + Math.random() * 4, Math.sin(a) * sp,
+            1.2
+          );
+        }
+      }
+    }
+
+    // Sparks & embers on ignition
+    if (ei > 0.3) {
+      for (let i = 0; i < Math.floor(ei * 4); i++) {
+        const a = Math.random() * Math.PI * 2;
+        emitParticle(sparks,
+          rocket.position.x + (Math.random() - 0.5) * 2,
+          ry - 1,
+          rocket.position.z + (Math.random() - 0.5) * 2,
+          Math.cos(a) * (4 + Math.random() * 10),
+          2 + Math.random() * 12,
+          Math.sin(a) * (4 + Math.random() * 10),
+          0.5
+        );
+      }
+      for (let i = 0; i < Math.floor(ei * 2); i++) {
+        emitParticle(embers,
+          rocket.position.x + (Math.random() - 0.5),
+          ry - 2 - Math.random() * 3,
+          rocket.position.z + (Math.random() - 0.5),
+          (Math.random() - 0.5) * 3,
+          -2 - Math.random() * 4,
+          (Math.random() - 0.5) * 3,
+          0.6
+        );
+      }
+    }
+
+    // Exhaust plume particles while rising
+    if (liftOff && ei > 0.5) {
+      for (let i = 0; i < 5; i++) {
+        emitParticle(plume,
+          rocket.position.x + (Math.random() - 0.5) * 2,
+          ry - 3 - Math.random() * 8,
+          rocket.position.z + (Math.random() - 0.5) * 2,
+          (Math.random() - 0.5) * 3,
+          -8 - Math.random() * 10 - rocketVel * 0.3,
+          (Math.random() - 0.5) * 3,
+          0.8
+        );
+      }
+    }
+
+    updateParticles(smoke, dt, 0.4 + smokeIntensity * 0.25);
+    updateParticles(dust, dt, 0.5);
+    updateParticles(sparks, dt, 0.85);
+    updateParticles(embers, dt, 0.8);
+    updateParticles(plume, dt, liftOff ? 0.4 : 0);
+
+    // Gravity on sparks
+    for (let i = 0; i < sparks.count; i++) {
+      if (sparks.ages[i] < sparks.lifetimes[i]) {
+        sparks.velocities[i * 3 + 1] -= 18 * dt;
+      }
+    }
+
+    // ── Grass reaction ──
+    if (ei > 0.2 || smokeIntensity > 0.3) {
+      const force = ei * 2.5 + smokeIntensity * 0.8;
+      for (let i = 0; i < grassCount; i++) {
+        const g = grassBase[i];
+        const d = Math.sqrt(g.x * g.x + g.z * g.z);
+        const lean = force * Math.max(0, 1 - d / 35) * 0.6;
+        const wind = Math.sin(t * 3 + g.phase) * 0.08;
+        const ang = Math.atan2(g.z, g.x);
+        grassDummy.position.set(g.x, 0, g.z);
+        grassDummy.rotation.set(
+          Math.cos(ang) * lean + wind,
+          g.phase,
+          -Math.sin(ang) * lean
+        );
+        grassDummy.scale.set(g.s, g.s, g.s);
+        grassDummy.updateMatrix();
+        grass.setMatrixAt(i, grassDummy.matrix);
+      }
+      grass.instanceMatrix.needsUpdate = true;
+    } else {
+      // Gentle idle sway
+      for (let i = 0; i < grassCount; i += 4) {
+        const g = grassBase[i];
+        grassDummy.position.set(g.x, 0, g.z);
+        grassDummy.rotation.set(Math.sin(t * 1.5 + g.phase) * 0.06, g.phase, 0);
+        grassDummy.scale.set(g.s, g.s, g.s);
+        grassDummy.updateMatrix();
+        grass.setMatrixAt(i, grassDummy.matrix);
+      }
+      grass.instanceMatrix.needsUpdate = true;
+    }
+
+    // ── Cinematic camera ──
+    const focusY = 18 + rocketY * 0.85;
+    lookAt.set(rocket.position.x, focusY, rocket.position.z);
+
+    let desiredDist, desiredHeight, desiredAngle;
+    if (!liftOff) {
+      desiredDist = 42;
+      desiredHeight = 16 + Math.sin(t * 0.15) * 1.5;
+      desiredAngle = 0.35 + t * 0.02;
+    } else {
+      const ft = t - T.liftoff;
+      desiredDist = 42 + Math.min(60, ft * 8);
+      desiredHeight = 16 + rocketY * 0.55 + Math.min(30, ft * 3);
+      desiredAngle = 0.35 + T.liftoff * 0.02 + ft * 0.04;
+    }
+
+    const idealX = lookAt.x + Math.sin(desiredAngle) * desiredDist;
+    const idealZ = lookAt.z + Math.cos(desiredAngle) * desiredDist;
+    const idealY = desiredHeight;
+
+    camPos.x += (idealX - camPos.x) * Math.min(1, dt * 1.8);
+    camPos.y += (idealY - camPos.y) * Math.min(1, dt * 1.8);
+    camPos.z += (idealZ - camPos.z) * Math.min(1, dt * 1.8);
+
+    // Shake
+    const sx = shakeAmp * noise(t * 22) * 0.8;
+    const sy = shakeAmp * noise(t * 19 + 1) * 0.5;
+    const sz = shakeAmp * noise(t * 25 + 3) * 0.8;
+
+    camera.position.set(camPos.x + sx, camPos.y + sy, camPos.z + sz);
+    camTarget.lerp(lookAt, Math.min(1, dt * 3));
+    camera.lookAt(camTarget);
+
+    // Sky color shift as we climb
+    if (rocketY > 20) {
+      const skyT = Math.min(1, (rocketY - 20) / 150);
+      scene.background.setRGB(
+        0.37 - skyT * 0.1,
+        0.72 - skyT * 0.15,
+        0.94 - skyT * 0.05
+      );
+    }
+
+    // Slow cloud drift
+    cloudGroup.rotation.y = t * 0.003;
+
+    renderer.render(scene, camera);
+  }
+
+  animate();
+})();
+</script>
+</body>
+</html>
