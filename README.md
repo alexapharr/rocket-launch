@@ -1,2 +1,1 @@
-# rocket-launch
-Three.js animated rocket launch scene
+A Three.js rocket launch demo.
